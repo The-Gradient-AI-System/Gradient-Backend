@@ -9,6 +9,9 @@
 ### І для інтеграції fastapi, в серидовищі .venv вписуємо:
     pip install fastapi uvicorn
 
+### Якщо пропонує оновити версію pip, вписуємо:
+    python -m pip install --upgrade pip
+
 ### Для запуску backend потрібна команда:
     uvicorn main:app --reload
 
