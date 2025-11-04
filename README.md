@@ -11,9 +11,6 @@
 
 ### Для запуску backend потрібна команда:
     uvicorn main:app --reload
-    
-### Комбінація клавіш для зупинки процесу (backend):
-    Ctrl + C
 
 ### Для встановлення залежностей потрібно вписати:
     pip install -r requirements.txt
