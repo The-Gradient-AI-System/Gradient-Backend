@@ -8,6 +8,9 @@
 
 ### Щоб перейти в серидовище потрібно вписати:
     .venv\Scripts\activate
+
+### Для того щоб вийти з серидовища .venv потрібно вписати:
+    deactivate
     
 ### І для інтеграції fastapi, в серидовищі .venv вписуємо:
     pip install fastapi uvicorn
