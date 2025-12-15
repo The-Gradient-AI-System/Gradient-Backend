@@ -1,5 +1,5 @@
 .venv
 __pycache__
-duckdb.exe
 requirements.txt
 db/
+.env
