@@ -1,6 +1,10 @@
 import duckdb
+from pathlib import Path
 
-conn = duckdb.connect("db/database.duckdb")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "db" / "database.duckdb"
+
+conn = duckdb.connect(DB_PATH)
 
 def init_db():
     conn.execute("""
@@ -9,6 +13,13 @@ def init_db():
         username TEXT UNIQUE NOT NULL,
         email TEXT NOT NULL,
         password TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS processed_emails (
+        gmail_id TEXT PRIMARY KEY,
+        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
