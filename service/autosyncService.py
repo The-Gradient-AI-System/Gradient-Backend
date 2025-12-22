@@ -9,4 +9,4 @@ async def auto_sync_loop():
         except Exception as e:
             print(f"[AUTO SYNC ERROR] {e}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(60) # 3600 (в фінальному поставити на одну годину)
