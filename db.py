@@ -7,17 +7,12 @@ DB_PATH = BASE_DIR / "db" / "database.duckdb"
 conn = duckdb.connect(DB_PATH)
 
 def init_db():
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS user_id_seq START WITH 1;")
-
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY DEFAULT nextval('user_id_seq'),
+        id INTEGER PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         email TEXT NOT NULL,
-        password TEXT NOT NULL,
-        phrase_hash TEXT,
-        phrase_expires_at TIMESTAMP,
-        phrase_revoked BOOLEAN DEFAULT FALSE
+        password TEXT NOT NULL
     )
     """)
 
