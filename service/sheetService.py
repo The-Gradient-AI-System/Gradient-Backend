@@ -34,7 +34,7 @@ def append_to_sheet(rows: list[list[str]]):
 
     service.spreadsheets().values().append(
         spreadsheetId=os.getenv("SPREADSHEET_ID"),
-        range="A:B",
+        range="A:J",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body=body
