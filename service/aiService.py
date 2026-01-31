@@ -28,9 +28,12 @@ COMPANY_SEARCH_ENABLED = os.getenv("COMPANY_SEARCH_ENABLED", "true").strip().low
 COMPANY_SEARCH_MAX_RESULTS = int(os.getenv("COMPANY_SEARCH_MAX_RESULTS", "6"))
 COMPANY_SEARCH_TIMEOUT_SECONDS = float(os.getenv("COMPANY_SEARCH_TIMEOUT_SECONDS", "6"))
 COMPANY_SEARCH_MAX_TOOL_CALLS = int(os.getenv("COMPANY_SEARCH_MAX_TOOL_CALLS", "2"))
+PERSON_SEARCH_MAX_RESULTS = int(os.getenv("PERSON_SEARCH_MAX_RESULTS", "4"))
 AI_DEBUG = os.getenv("AI_DEBUG", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 _company_search_cache: Dict[str, str] = {}
+_company_search_struct_cache: Dict[str, list[dict[str, str]]] = {}
+_person_search_cache: Dict[str, list[dict[str, str]]] = {}
 
 
 _PERSONAL_EMAIL_DOMAINS = {
@@ -143,6 +146,7 @@ def search_company_tool(company_name: str) -> str:
         if not aggregated:
             out = "No info found online."
             _company_search_cache[company_name] = out
+            _company_search_struct_cache[company_name] = []
             return out
 
         context_lines = [
@@ -151,6 +155,7 @@ def search_company_tool(company_name: str) -> str:
         ]
         context = "\n".join(context_lines)
         _company_search_cache[company_name] = context
+        _company_search_struct_cache[company_name] = aggregated
         return context
     except TimeoutError:
         out = "Search timeout."
@@ -160,6 +165,50 @@ def search_company_tool(company_name: str) -> str:
         out = f"Error during search: {e}"
         _company_search_cache[company_name] = out
         return out
+
+
+def search_person_insights(full_name: str, company_hint: str | None = None) -> list[dict[str, str]]:
+    """Search for person insights using DuckDuckGo to infer role and social links."""
+
+    if not full_name:
+        return []
+
+    cache_key = f"{full_name}|{company_hint or ''}"
+    if cache_key in _person_search_cache:
+        return _person_search_cache[cache_key]
+
+    query = full_name
+    if company_hint:
+        query = f"{full_name} {company_hint}"
+
+    results: list[dict[str, str]] = []
+
+    try:
+        with DDGS() as ddgs:
+            matches = ddgs.text(query, max_results=PERSON_SEARCH_MAX_RESULTS)
+
+        for match in matches:
+            title = (match.get("title") or "").strip()
+            snippet = (match.get("body") or "").strip()
+            url = (match.get("href") or match.get("url") or "").strip()
+
+            if not any([title, snippet, url]):
+                continue
+
+            results.append({
+                "title": title,
+                "snippet": snippet,
+                "url": url,
+            })
+
+            if len(results) >= PERSON_SEARCH_MAX_RESULTS:
+                break
+    except Exception as exc:  # pragma: no cover - network errors tolerated
+        if AI_DEBUG:
+            print(f"[AI] person search failed: {exc}")
+
+    _person_search_cache[cache_key] = results
+    return results
 
 
 def fetch_website_tool(url: str) -> str:
@@ -290,13 +339,15 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         "Finally, return ONLY a valid JSON object with the exact keys: "
         "email, first_name, last_name, full_name, company, company_summary, "
         "order_number, order_description, amount, currency, "
-        "phone_number, website. "
+        "phone_number, website, person_role, person_location, person_experience, person_links, person_summary. "
         "If some field is not present, set it to null. "
         "If amount is present, use a number (dot as decimal separator)."
     )
 
     company_candidate = _company_candidate_from_sender_email(sender)
     website_candidate = _website_candidate_from_body(body)
+    company_for_search: str | None = None
+    company_insights_struct: list[dict[str, str]] = []
 
     if AI_DEBUG:
         # Avoid logging full PII content (body, full sender). Keep only high-level signal.
@@ -335,6 +386,7 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
 
     # Step 2: Always enrich ("search always") if enabled.
     enrichment_parts: list[str] = []
+    person_enrichment: list[dict[str, str]] = []
     if COMPANY_SEARCH_ENABLED:
         company_for_search = base_data.get("company") or company_candidate
         website_for_fetch = _normalize_website(base_data.get("website") or website_candidate)
@@ -344,6 +396,17 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
 
         if company_for_search and len(enrichment_parts) < max(COMPANY_SEARCH_MAX_TOOL_CALLS, 0):
             enrichment_parts.append("[DDG_SEARCH]\n" + search_company_tool(company_for_search))
+            company_insights_struct = _company_search_struct_cache.get(company_for_search, [])
+
+        person_name = base_data.get("full_name") or base_data.get("first_name")
+        if person_name:
+            person_enrichment = search_person_insights(person_name, company_for_search)
+            if person_enrichment:
+                formatted = "\n".join(
+                    f"{idx}. {item.get('title', 'Без заголовку')}\n   {item.get('snippet', '')}\n   {item.get('url', '')}"
+                    for idx, item in enumerate(person_enrichment, start=1)
+                )
+                enrichment_parts.append("[PERSON_SEARCH]\n" + formatted)
 
     enrichment_context = "\n\n".join(enrichment_parts) if enrichment_parts else ""
 
@@ -351,6 +414,7 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
     final_system_prompt = (
         system_prompt
         + " Use the enrichment context (if provided) to populate company_summary and website accurately."
+        + " If person search results are provided, populate role, experience level, social links when possible."
     )
 
     final_user_prompt = (
@@ -370,16 +434,39 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         response_format={"type": "json_object"},
     )
 
-    content = final_response.choices[0].message.content
-
+    final_content = final_response.choices[0].message.content
     try:
-        data = json.loads(content)
+        data = json.loads(final_content)
     except json.JSONDecodeError:
         data = {}
 
-    # Ensure all expected keys exist
-    result: Dict[str, Any] = {
-        "email": data.get("email"),
+    person_links = data.get("person_links") or []
+    if isinstance(person_links, str):
+        person_links = [person_links]
+
+    if not isinstance(person_links, list):
+        person_links = []
+
+    person_summary = data.get("person_summary")
+    if not person_summary:
+        summary_parts: list[str] = []
+        role = data.get("person_role")
+        if role:
+            summary_parts.append(f"Роль: {role}")
+        location = data.get("person_location")
+        if location:
+            summary_parts.append(f"Локація: {location}")
+        experience = data.get("person_experience")
+        if experience:
+            summary_parts.append(f"Досвід: {experience}")
+        if person_enrichment:
+            first_snippet = next((item.get("snippet") for item in person_enrichment if item.get("snippet")), None)
+            if first_snippet:
+                summary_parts.append(first_snippet)
+        person_summary = " | ".join(summary_parts) if summary_parts else None
+
+    result = {
+        "email": data.get("email") or sender,
         "first_name": data.get("first_name"),
         "last_name": data.get("last_name"),
         "full_name": data.get("full_name"),
@@ -391,6 +478,13 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         "currency": data.get("currency"),
         "phone_number": data.get("phone_number"),
         "website": data.get("website"),
+        "person_insights": person_enrichment,
+        "person_role": data.get("person_role"),
+        "person_location": data.get("person_location"),
+        "person_experience": data.get("person_experience"),
+        "person_links": person_links,
+        "company_insights": company_insights_struct,
+        "person_summary": person_summary,
     }
 
     return result

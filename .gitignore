@@ -1,6 +1,9 @@
-.venv
+.venv/
+.venv311/
 __pycache__
 .env
 db/
 credentials/
 notes.txt
+credentials/token.json
+credentials/credentials.json
