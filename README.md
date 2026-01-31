@@ -33,3 +33,6 @@
 
 ### Щоб зайти в термінал duckdb, скористаємось командою:
     .\duckdb.exe db\database.duckdb
+
+### uvicorn main:app --reload
+### python -m uvicorn main:app --reload

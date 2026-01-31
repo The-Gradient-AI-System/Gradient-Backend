@@ -2,6 +2,7 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from pathlib import Path
 import base64
+import json
 
 from db import conn
 from service.aiService import analyze_email
@@ -11,6 +12,29 @@ CREDENTIALS_DIR = BASE_DIR / "credentials"
 TOKEN_FILE = CREDENTIALS_DIR / "token.json"
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+_MESSAGE_VALUE_COLUMNS = [
+    "status",
+    "first_name",
+    "last_name",
+    "full_name",
+    "email",
+    "subject",
+    "received_at",
+    "company",
+    "body",
+    "phone",
+    "website",
+    "company_name",
+    "company_info",
+    "person_role",
+    "person_links",
+    "person_location",
+    "person_experience",
+    "person_summary",
+    "person_insights",
+    "company_insights",
+]
 
 
 def get_gmail_service():
@@ -89,6 +113,87 @@ def _extract_body(payload: dict) -> str:
     return _decode_body(body)
 
 
+def _store_message(gmail_id: str, values: list[str]) -> None:
+    existing = conn.execute(
+        "SELECT synced_at FROM gmail_messages WHERE gmail_id = ?",
+        [gmail_id]
+    ).fetchone()
+
+    columns_sql = ", ".join(_MESSAGE_VALUE_COLUMNS)
+    placeholders = ", ".join(["?"] * len(_MESSAGE_VALUE_COLUMNS))
+
+    if existing is None:
+        conn.execute(
+            f"""
+            INSERT INTO gmail_messages (gmail_id, {columns_sql})
+            VALUES (?, {placeholders})
+            """,
+            [gmail_id, *values]
+        )
+    else:
+        assignments = ", ".join(f"{col} = ?" for col in _MESSAGE_VALUE_COLUMNS)
+        conn.execute(
+            f"""
+            UPDATE gmail_messages
+            SET {assignments}
+            WHERE gmail_id = ?
+            """,
+            [*values, gmail_id]
+        )
+
+
+def get_unsynced_message_rows(limit: int | None = None) -> list[tuple[str, list[str]]]:
+    columns_sql = ", ".join(_MESSAGE_VALUE_COLUMNS)
+    query = (
+        f"SELECT gmail_id, {columns_sql} "
+        "FROM gmail_messages "
+        "WHERE synced_at IS NULL "
+        "ORDER BY created_at"
+    )
+
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+
+    rows = conn.execute(query).fetchall()
+
+    result: list[tuple[str, list[str]]] = []
+    for row in rows:
+        gmail_id = row[0]
+        values = [_normalize_cell(row[idx + 1]) for idx in range(len(_MESSAGE_VALUE_COLUMNS))]
+        result.append((gmail_id, values))
+
+    return result
+
+
+def mark_messages_synced(gmail_ids: list[str]) -> None:
+    if not gmail_ids:
+        return
+
+    placeholders = ", ".join(["?"] * len(gmail_ids))
+    conn.execute(
+        f"""
+        UPDATE gmail_messages
+        SET synced_at = CURRENT_TIMESTAMP
+        WHERE gmail_id IN ({placeholders})
+        """,
+        gmail_ids
+    )
+
+
+def _normalize_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value) if not isinstance(value, str) else value
+
+
+def _normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
 
 def fetch_new_gmail_data(limit: int = 20):
     service = get_gmail_service()
@@ -139,7 +244,8 @@ def fetch_new_gmail_data(limit: int = 20):
 
         recipient = headers.get("To", "")
         
-        body = _extract_body(payload)
+        body_original = _extract_body(payload)
+        body = _normalize_text(body_original)
 
         parsed = analyze_email(subject=subject, body=body, sender=sender_email)
 
@@ -148,21 +254,43 @@ def fetch_new_gmail_data(limit: int = 20):
         
         # Get company info if company name is available
         company_info = parsed.get("company_summary") or "No company info"
+        person_summary = parsed.get("person_summary")
+        first_name = parsed.get("first_name")
+        last_name = parsed.get("last_name")
+
+        person_links = parsed.get("person_links") or []
+        if not isinstance(person_links, list):
+            person_links = [person_links] if person_links else []
+        person_links_value = json.dumps(person_links, ensure_ascii=False)
+
+        person_insights_value = json.dumps(parsed.get("person_insights") or [], ensure_ascii=False)
+        company_insights_value = json.dumps(parsed.get("company_insights") or [], ensure_ascii=False)
 
         row = [
+            "waiting",  # status
+            first_name,
+            last_name,
             final_sender_name,
             sender_email,
             subject,
             formatted_date,
-            parsed.get("company"),  # Index 4: Company header
+            parsed.get("company"),
             body,
             parsed.get("phone_number"),
             parsed.get("website"),
-            parsed.get("company"),  # Index 8: Company Name header
-            company_info,  # Company Info from scraper
+            parsed.get("company"),
+            company_info,
+            parsed.get("person_role"),
+            person_links_value,
+            parsed.get("person_location"),
+            parsed.get("person_experience"),
+            person_summary,
+            person_insights_value,
+            company_insights_value,
         ]
 
         rows.append(row)
+        _store_message(msg_id, row)
         mark_as_processed(msg_id)
 
     return rows
