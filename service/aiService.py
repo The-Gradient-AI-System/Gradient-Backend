@@ -12,6 +12,7 @@ import re
 import requests
 
 load_dotenv()
+from service.settingsService import get_reply_prompts
 
 
 client = OpenAI()
@@ -34,6 +35,221 @@ AI_DEBUG = os.getenv("AI_DEBUG", "false").strip().lower() in {"1", "true", "yes"
 _company_search_cache: Dict[str, str] = {}
 _company_search_struct_cache: Dict[str, list[dict[str, str]]] = {}
 _person_search_cache: Dict[str, list[dict[str, str]]] = {}
+
+MAX_REPLY_WORDS = 140
+REPLY_VARIANTS = ("follow_up", "recap")
+
+
+def _to_serializable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _to_serializable(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_to_serializable(item) for item in value]
+    if isinstance(value, (str, int, float)) or value is None:
+        return value
+    if isinstance(value, bool):
+        return value
+    return str(value)
+
+
+def _pretty_json(data: dict | list | None) -> str:
+    if not data:
+        return "{}"
+    try:
+        return json.dumps(_to_serializable(data), ensure_ascii=False, indent=2)
+    except Exception:
+        return json.dumps({}, indent=2)
+
+
+def _enforce_word_limit(text: str, max_words: int = MAX_REPLY_WORDS) -> str:
+    words = re.findall(r"\S+", text)
+    if len(words) <= max_words:
+        return text.strip()
+    trimmed = " ".join(words[:max_words]).strip()
+    if not trimmed.endswith((".", "!", "?")):
+        trimmed += "..."
+    return trimmed
+
+
+def _normalize_placeholder_key(key: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
+
+
+def _flatten_for_placeholders(prefix: str, value: Any) -> dict[str, str]:
+    items: dict[str, str] = {}
+    if value is None:
+        return items
+    if isinstance(value, dict):
+        for sub_key, sub_val in value.items():
+            combined = f"{prefix}_{sub_key}" if prefix else str(sub_key)
+            items.update(_flatten_for_placeholders(combined, sub_val))
+        return items
+    if isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            for idx, item in enumerate(value, start=1):
+                combined = f"{prefix}_{idx}" if prefix else str(idx)
+                items.update(_flatten_for_placeholders(combined, item))
+        else:
+            items[prefix] = ", ".join(str(item) for item in value if str(item).strip())
+        return items
+
+    if prefix:
+        items[prefix] = str(value)
+    return items
+
+
+def _collect_placeholder_mapping(
+    lead: dict[str, Any] | None,
+    email: dict[str, Any] | None,
+    placeholders: dict[str, Any] | None,
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+
+    def register(key: str, value: Any) -> None:
+        if value is None:
+            return
+        norm = _normalize_placeholder_key(key)
+        if not norm:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        mapping.setdefault(norm, text)
+
+    for source in (placeholders or {}).items():
+        key, value = source
+        register(str(key), value)
+
+    for key, value in (email or {}).items():
+        register(f"email_{key}", value)
+
+    for key, value in (lead or {}).items():
+        register(f"lead_{key}", value)
+
+    for key, value in _flatten_for_placeholders("lead", lead or {}).items():
+        register(key, value)
+
+    for key, value in _flatten_for_placeholders("email", email or {}).items():
+        register(key, value)
+
+    full_name = (lead or {}).get("full_name") or "".join(
+        filter(None, [
+            (lead or {}).get("first_name"),
+            (lead or {}).get("last_name"),
+        ])
+    )
+    if full_name:
+        register("name", full_name)
+        register("client_name", full_name)
+
+    subject = (email or {}).get("subject")
+    if subject:
+        register("subject", subject)
+        register("topic_discussed", subject)
+
+    return mapping
+
+
+def _render_prompt(template: str, mapping: dict[str, str]) -> str:
+    if not template:
+        return ""
+
+    pattern = re.compile(r"\[([^\[\]]+)\]")
+
+    def replacer(match: re.Match[str]) -> str:
+        raw_key = match.group(1)
+        norm_key = _normalize_placeholder_key(raw_key)
+        replacement = mapping.get(norm_key)
+        return replacement if replacement is not None else match.group(0)
+
+    return pattern.sub(replacer, template).strip()
+
+
+def _compose_reply_context(
+    lead: dict[str, Any] | None,
+    email: dict[str, Any] | None,
+    placeholders: dict[str, Any] | None,
+) -> str:
+    sections: list[str] = []
+    email_section = _pretty_json(email or {})
+    lead_section = _pretty_json(lead or {})
+    sections.append(f"EMAIL CONTEXT:\n{email_section}")
+    sections.append(f"LEAD DATA:\n{lead_section}")
+    if placeholders:
+        sections.append(f"ADDITIONAL PLACEHOLDERS:\n{_pretty_json(placeholders)}")
+    return "\n\n".join(sections)
+
+
+def _build_reply_messages(rendered_prompt: str, context: str) -> list[dict[str, str]]:
+    system_prompt = (
+        "You are an experienced sales development representative drafting concise email replies. "
+        "Always respond in English. Limit the reply to 140 words. Use only factual information provided in the context. "
+        "Do not invent names, dates, or commitments beyond what the context states."
+    )
+
+    user_prompt = (
+        "Follow this reply blueprint and fill placeholders with the factual details from the context.\n\n"
+        f"Reply blueprint:\n{rendered_prompt or '<no prompt provided>'}\n\n"
+        f"Context with factual data:\n{context or '<empty>'}\n\n"
+        "Output only the email body, without subject lines, notes, or extra commentary."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def generate_email_replies(
+    *,
+    lead: dict[str, Any] | None,
+    email: dict[str, Any] | None,
+    placeholders: dict[str, Any] | None = None,
+    prompt_overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Generate two reply variants (follow_up, recap) using configurable prompts."""
+
+    stored_prompts = get_reply_prompts()
+    prompts: dict[str, str] = {
+        variant: (stored_prompts.get(variant) or "")
+        for variant in REPLY_VARIANTS
+    }
+
+    if prompt_overrides:
+        for key, value in prompt_overrides.items():
+            if key in prompts and isinstance(value, str) and value.strip():
+                prompts[key] = value
+
+    mapping = _collect_placeholder_mapping(lead, email, placeholders)
+    context = _compose_reply_context(lead, email, placeholders)
+
+    replies: dict[str, str] = {}
+    for variant in REPLY_VARIANTS:
+        template = prompts.get(variant, "")
+        rendered_prompt = _render_prompt(template, mapping)
+
+        if not rendered_prompt:
+            replies[variant] = ""
+            continue
+
+        messages = _build_reply_messages(rendered_prompt, context)
+
+        try:
+            completion = client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.35,
+            )
+            choice = completion.choices[0] if completion.choices else None
+            content = choice.message.content if choice and choice.message else ""
+        except Exception as exc:  # pragma: no cover - guardrail in case OpenAI errors
+            if AI_DEBUG:
+                print(f"[AI] generate_email_replies error for {variant}: {exc}")
+            content = ""
+
+        replies[variant] = _enforce_word_limit(content or "")
+
+    return replies
 
 
 _PERSONAL_EMAIL_DOMAINS = {
