@@ -43,13 +43,14 @@ def append_to_sheet(rows: list[list[str]]):
 
     service.spreadsheets().values().append(
         spreadsheetId=os.getenv("SPREADSHEET_ID"),
-        range="A:T",
+        range="A:Y",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body=body
     ).execute()
 
 
+# A:Y = 25 колонок (20 оригінальних + is_lead, priority, status_label, tone, preprocessed_at)
 DEFAULT_HEADERS = [
     "status",
     "first_name",
@@ -71,6 +72,11 @@ DEFAULT_HEADERS = [
     "person_summary",
     "person_insights",
     "company_insights",
+    "is_lead",
+    "priority",
+    "status_label",
+    "tone",
+    "preprocessed_at",
 ]
 
 
@@ -96,7 +102,7 @@ def fetch_sheet_rows(limit: int | None = 120) -> list[dict[str, str]]:
 
     result = service.spreadsheets().values().get(
         spreadsheetId=os.getenv("SPREADSHEET_ID"),
-        range="A:T"
+        range="A:Y"
     ).execute()
 
     values = result.get("values", [])
@@ -161,6 +167,10 @@ def fetch_sheet_rows(limit: int | None = 120) -> list[dict[str, str]]:
         entry["person_summary"] = entry.get("person_summary") or ""
         entry["first_name"] = entry.get("first_name") or ""
         entry["last_name"] = entry.get("last_name") or ""
+        entry["is_lead"] = entry.get("is_lead", "").strip().lower() in ("true", "1", "yes")
+        entry["priority"] = entry.get("priority") or "normal"
+        entry["status_label"] = entry.get("status_label") or ""
+        entry["tone"] = entry.get("tone") or ""
         entry["sheet_row"] = row_number
 
         leads.append(entry)

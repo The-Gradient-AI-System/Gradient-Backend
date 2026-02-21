@@ -37,7 +37,11 @@ _company_search_struct_cache: Dict[str, list[dict[str, str]]] = {}
 _person_search_cache: Dict[str, list[dict[str, str]]] = {}
 
 MAX_REPLY_WORDS = 140
-REPLY_VARIANTS = ("follow_up", "recap")
+REPLY_VARIANTS = ("follow_up", "recap", "quick")
+REPLY_STYLES = ("Офіційний", "Напівофіційний")
+# Ключі для 6 варіантів: quick_official, quick_semi, follow_up_official, follow_up_semi, recap_official, recap_semi
+REPLY_SIX_SUFFIX = {"Офіційний": "official", "Напівофіційний": "semi"}
+REPLY_SIX_KEYS = tuple(f"{v}_{REPLY_SIX_SUFFIX[s]}" for v in REPLY_VARIANTS for s in REPLY_STYLES)
 
 
 def _to_serializable(value: Any) -> Any:
@@ -180,12 +184,45 @@ def _compose_reply_context(
     return "\n\n".join(sections)
 
 
-def _build_reply_messages(rendered_prompt: str, context: str) -> list[dict[str, str]]:
-    system_prompt = (
-        "You are an experienced sales development representative drafting concise email replies. "
-        "Always respond in English. Limit the reply to 140 words. Use only factual information provided in the context. "
-        "Do not invent names, dates, or commitments beyond what the context states."
-    )
+# Промпт 2: генерація відповіді з урахуванням тону листа та стилю (підставляються tone, email_type, email_style)
+REPLY_SYSTEM_PROMPT_P2 = """Ти — професійний AI-копірайтер. Твоє завдання — написати відповідь на вхідний лист клієнта.
+
+[ВХІДНІ ДАНІ]
+Характер вхідного листа: {tone}
+(Враховуй це: якщо клієнт напористий — відповідай чітко і по суті; якщо доброзичливий — відповідай тепло.)
+
+Тип листа, який треба створити: {email_type}
+- follow_up: нагадування або підтримка контакту
+- recap: підсумок домовленостей або пропозиція
+- quick: коротка, швидка відповідь
+
+Стиль написання: {email_style}
+- Офіційний: суворо професійний, діловий
+- Напівофіційний: професійний, але легший і дружній
+
+[ЗАВДАННЯ]
+Напиши текст відповіді мовою оригіналу вхідного листа. Не пиши тему листа, лише тіло. Використовуй плейсхолдери в квадратних дужках (наприклад [Твоє ім'я], [Посилання]), якщо потрібно додати файли чи конкретну інформацію. Обмеж 140 слів. Використовуй лише факти з контексту."""
+
+
+def _build_reply_messages(
+    rendered_prompt: str,
+    context: str,
+    tone: str | None = None,
+    email_type: str | None = None,
+    email_style: str | None = None,
+) -> list[dict[str, str]]:
+    if tone is not None and email_style is not None and email_type is not None:
+        system_prompt = REPLY_SYSTEM_PROMPT_P2.format(
+            tone=tone or "Простий",
+            email_type=email_type or "quick",
+            email_style=email_style or "Напівофіційний",
+        )
+    else:
+        system_prompt = (
+            "You are an experienced sales development representative drafting concise email replies. "
+            "Always respond in English. Limit the reply to 140 words. Use only factual information provided in the context. "
+            "Do not invent names, dates, or commitments beyond what the context states."
+        )
 
     user_prompt = (
         "Follow this reply blueprint and fill placeholders with the factual details from the context.\n\n"
@@ -206,8 +243,10 @@ def generate_email_replies(
     email: dict[str, Any] | None,
     placeholders: dict[str, Any] | None = None,
     prompt_overrides: dict[str, str] | None = None,
+    tone: str | None = None,
+    email_style: str | None = None,
 ) -> dict[str, str]:
-    """Generate two reply variants (follow_up, recap) using configurable prompts."""
+    """Generate reply variants (follow_up, recap, quick) using configurable prompts. Optional tone and email_style use Prompt 2."""
 
     stored_prompts = get_reply_prompts()
     prompts: dict[str, str] = {
@@ -223,17 +262,20 @@ def generate_email_replies(
     mapping = _collect_placeholder_mapping(lead, email, placeholders)
     context = _compose_reply_context(lead, email, placeholders)
 
-    replies: dict[str, str] = {}
-    for variant in REPLY_VARIANTS:
+    use_prompt2 = tone is not None and email_style is not None
+
+    def _generate_one(variant: str) -> tuple[str, str]:
         template = prompts.get(variant, "")
         rendered_prompt = _render_prompt(template, mapping)
-
         if not rendered_prompt:
-            replies[variant] = ""
-            continue
-
-        messages = _build_reply_messages(rendered_prompt, context)
-
+            return (variant, "")
+        messages = _build_reply_messages(
+            rendered_prompt,
+            context,
+            tone=tone if use_prompt2 else None,
+            email_type=variant if use_prompt2 else None,
+            email_style=email_style if use_prompt2 else None,
+        )
         try:
             completion = client.chat.completions.create(
                 model=AI_MODEL,
@@ -242,14 +284,128 @@ def generate_email_replies(
             )
             choice = completion.choices[0] if completion.choices else None
             content = choice.message.content if choice and choice.message else ""
-        except Exception as exc:  # pragma: no cover - guardrail in case OpenAI errors
+        except Exception as exc:  # pragma: no cover
             if AI_DEBUG:
                 print(f"[AI] generate_email_replies error for {variant}: {exc}")
             content = ""
+        return (variant, _enforce_word_limit(content or ""))
 
-        replies[variant] = _enforce_word_limit(content or "")
+    replies: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_generate_one, v) for v in REPLY_VARIANTS]
+        for fut in futures:
+            variant, content = fut.result()
+            replies[variant] = content
 
     return replies
+
+
+def generate_email_replies_six(
+    *,
+    lead: dict[str, Any] | None,
+    email: dict[str, Any] | None,
+    placeholders: dict[str, Any] | None = None,
+    prompt_overrides: dict[str, str] | None = None,
+    tone: str | None = None,
+) -> dict[str, str]:
+    """Генерує 6 варіантів відповіді (3 типи × 2 стилі) паралельно. Ключі: quick_official, quick_semi, follow_up_official, follow_up_semi, recap_official, recap_semi."""
+    stored_prompts = get_reply_prompts()
+    prompts = {v: (stored_prompts.get(v) or "") for v in REPLY_VARIANTS}
+    if prompt_overrides:
+        for key, value in prompt_overrides.items():
+            if key in prompts and isinstance(value, str) and value.strip():
+                prompts[key] = value
+
+    mapping = _collect_placeholder_mapping(lead, email, placeholders)
+    context = _compose_reply_context(lead, email, placeholders)
+    tone_val = tone or "Простий"
+
+    def _generate_one_six(variant: str, email_style: str) -> tuple[str, str]:
+        key = f"{variant}_{REPLY_SIX_SUFFIX[email_style]}"
+        template = prompts.get(variant, "")
+        rendered_prompt = _render_prompt(template, mapping)
+        if not rendered_prompt:
+            return (key, "")
+        messages = _build_reply_messages(
+            rendered_prompt,
+            context,
+            tone=tone_val,
+            email_type=variant,
+            email_style=email_style,
+        )
+        try:
+            completion = client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                temperature=0.35,
+            )
+            choice = completion.choices[0] if completion.choices else None
+            content = choice.message.content if choice and choice.message else ""
+        except Exception as exc:
+            if AI_DEBUG:
+                print(f"[AI] generate_email_replies_six error for {key}: {exc}")
+            content = ""
+        return (key, _enforce_word_limit(content or ""))
+
+    replies_six: dict[str, str] = {}
+    tasks = [(v, s) for v in REPLY_VARIANTS for s in REPLY_STYLES]
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(_generate_one_six, v, s) for v, s in tasks]
+        for fut in futures:
+            key, content = fut.result()
+            replies_six[key] = content
+
+    return replies_six
+
+
+# --- Етап 1: швидкий пре-процесинг листа (is_lead, priority, tone) ---
+
+PREPROCESS_SYSTEM_PROMPT = """Ти — автоматична система пре-процесингу електронної пошти. Твоє завдання — проаналізувати вхідний лист і повернути результат ВИКЛЮЧНО у форматі JSON без жодного додаткового тексту.
+
+Правила аналізу:
+1. Визнач ім'я та прізвище відправника (sender_name), якщо вказано в листі або в адресі. Якщо ні — null.
+2. Ідентифікація клієнта (is_lead): шукай ключові слова та наміри: "прайс", "ціна", "стати клієнтом", "замовити", "купити", "співпраця", "partnership", "price", "quote", "order", "collaboration". Якщо є ознаки комерційного/ділового інтересу — is_lead: true, інакше false.
+3. Характер листа (tone) — обери рівно один з трьох:
+   - "Агресивний/Напористий" — вимоги, претензії, терміновість, наполегливість
+   - "Простий" — звичайне питання, коротке повідомлення, нейтральний тон
+   - "Доброзичливий" — ввічливий тон, подяка, приємне спілкування
+
+Формат виводу (тільки JSON, без markdown і коментарів):
+{"sender_name": "Ім'я Прізвище або null", "is_lead": true або false, "priority": "high" якщо is_lead true інакше "normal", "status_label": "очікує на перевірку" якщо is_lead true інакше "звичайний", "tone": "Агресивний/Напористий" | "Простий" | "Доброзичливий"}"""
+
+
+def preprocess_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
+    """
+    Етап 1: один швидкий виклик OpenAI. Повертає sender_name, is_lead, priority, status_label, tone.
+    Без пошуків DDG та fetch сайтів.
+    """
+    user_content = (
+        f"Відправник (email): {sender}\nТема: {subject}\n\nТіло листа:\n{body[:8000]}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": PREPROCESS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content
+        data = json.loads(raw) if raw else {}
+    except Exception as exc:
+        if AI_DEBUG:
+            print(f"[AI] preprocess_email error: {exc}")
+        data = {}
+
+    return {
+        "sender_name": data.get("sender_name"),
+        "is_lead": bool(data.get("is_lead")),
+        "priority": "high" if data.get("is_lead") else "normal",
+        "status_label": data.get("status_label") or ("очікує на перевірку" if data.get("is_lead") else "звичайний"),
+        "tone": data.get("tone") or "Простий",
+    }
 
 
 _PERSONAL_EMAIL_DOMAINS = {
@@ -514,7 +670,44 @@ def _website_candidate_from_body(body: str) -> str | None:
     if not body:
         return None
     m = re.search(r"https?://[^\s)\]>\"']+", body, flags=re.IGNORECASE)
+    if m:
+        return m.group(0)
+    # Bare domain in signature, e.g. "microsoft.com" or "thegradient.com"
+    m = re.search(r"\b([a-z0-9][-a-z0-9]*\.[a-z]{2,}(?:\.[a-z]{2,})?)\b", body, flags=re.IGNORECASE)
     return m.group(0) if m else None
+
+
+def _extract_phone_from_text(text: str) -> str | None:
+    """Best-effort phone extraction (E.164-like, with spaces/dashes/parens)."""
+    if not text:
+        return None
+    # Match +1 (312) 555-9044, +1 312 555 9044, (312) 555-9044, 312-555-9044, etc.
+    patterns = [
+        r"\+\s*\d{1,4}[\s\-.]*\(?\d{2,4}\)?[\s\-.]*\d{2,4}[\s\-.]*\d{2,4}[\s\-.]*\d{0,4}",
+        r"\(?\d{2,4}\)?[\s\-.]*\d{2,4}[\s\-.]*\d{2,4}[\s\-.]*\d{0,4}",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            candidate = m.group(0).strip()
+            if len(re.sub(r"\D", "", candidate)) >= 7:
+                return candidate
+    return None
+
+
+def _extract_company_from_subject(subject: str) -> str | None:
+    """Try to get company name from subject, e.g. 'Project X - Microsoft x Gradient' -> Microsoft or Gradient."""
+    if not subject:
+        return None
+    # "Company A x Company B" or "Company A / Company B" or "Company A - Company B"
+    for sep in [" x ", " × ", " / ", " - "]:
+        if sep in subject:
+            parts = re.split(re.escape(sep) + r"|\s*-\s*", subject, maxsplit=2)
+            for p in parts:
+                p = p.strip()
+                if len(p) > 2 and p.lower() not in ("project", "inquiry", "partnership", "mobile", "iot"):
+                    return p
+    return None
 
 
 def _normalize_website(url: str | None) -> str | None:
@@ -548,11 +741,14 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
     system_prompt = (
         "You are an intelligent email parsing assistant. "
         "Your goal involves two steps: "
-        "1) Extract structured data from the email. "
+        "1) Extract structured data from the ENTIRE email, including the main body AND the email signature at the end. "
         "2) If you identify a company name, call the tool 'search_company_tool' to get extra company details. "
-        "If no company name is explicitly present in the email text, you may infer a company from the sender email domain "
-        "(but do not infer companies for personal email providers like gmail.com). "
-        "Finally, return ONLY a valid JSON object with the exact keys: "
+        "CRITICAL: The signature block (last lines of the email) usually contains: "
+        "person_role (e.g. 'Managing Partner', 'CEO', 'Sales Manager'), phone_number (e.g. +1 (312) 555-9044), "
+        "company name, website (e.g. microsoft.com or full URL), and sometimes address. Always parse the signature and fill these fields. "
+        "The subject line may also contain company names (e.g. 'Microsoft x Gradient' or 'Partnership - Acme Corp'). "
+        "If no company is in the body/signature, you may infer from sender domain (except personal domains like gmail.com). "
+        "Return ONLY a valid JSON object with the exact keys: "
         "email, first_name, last_name, full_name, company, company_summary, "
         "order_number, order_description, amount, currency, "
         "phone_number, website, person_role, person_location, person_experience, person_links, person_summary. "
@@ -574,12 +770,13 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         )
 
     user_prompt = (
-        "Extract data from the following email.\n\n"
+        "Extract data from the following email. Parse the FULL text including any signature at the end "
+        "(signatures often contain: name, job title/role, company, website, phone, address).\n\n"
         f"Sender email: {sender}\n"
         f"Sender domain company candidate (may be null): {company_candidate}\n"
         f"Website URL found in body (may be null): {website_candidate}\n"
         f"Subject: {subject}\n\n"
-        "Body:\n" + body
+        "Body:\n" + (body or "")
     )
 
     # Step 1: Always do deterministic extraction to JSON first.
@@ -599,6 +796,18 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         base_data = json.loads(base_content)
     except json.JSONDecodeError:
         base_data = {}
+
+    # Fallbacks when the model leaves fields empty but we can extract from body/subject
+    if not (base_data.get("phone_number") or "").strip():
+        phone_fallback = _extract_phone_from_text(body)
+        if phone_fallback:
+            base_data["phone_number"] = phone_fallback
+    if not (base_data.get("website") or "").strip() and website_candidate:
+        base_data["website"] = website_candidate
+    if not (base_data.get("company") or "").strip():
+        company_fallback = _extract_company_from_subject(subject)
+        if company_fallback:
+            base_data["company"] = company_fallback
 
     # Step 2: Always enrich ("search always") if enabled.
     enrichment_parts: list[str] = []
@@ -655,6 +864,18 @@ def analyze_email(subject: str, body: str, sender: str) -> Dict[str, Any]:
         data = json.loads(final_content)
     except json.JSONDecodeError:
         data = {}
+
+    # Final fallbacks so we never drop data we can extract from the email text
+    if not (data.get("phone_number") or "").strip():
+        phone_f = _extract_phone_from_text(body)
+        if phone_f:
+            data["phone_number"] = phone_f
+    if not (data.get("website") or "").strip() and website_candidate:
+        data["website"] = website_candidate
+    if not (data.get("company") or "").strip():
+        company_f = _extract_company_from_subject(subject)
+        if company_f:
+            data["company"] = company_f
 
     person_links = data.get("person_links") or []
     if isinstance(person_links, str):

@@ -111,3 +111,45 @@ def test_company_candidate_from_domain(monkeypatch):
 
     assert ai_service._company_candidate_from_sender_email("a@nova-poshta.ua") == "Nova Poshta"
     assert ai_service._company_candidate_from_sender_email("a@gmail.com") is None
+
+
+def test_generate_email_replies_returns_three_variants(monkeypatch):
+    import importlib
+    import types
+
+    import service.aiService as ai_service
+
+    importlib.reload(ai_service)
+
+    # Force deterministic prompts and avoid DB dependency in this unit test.
+    monkeypatch.setattr(
+        ai_service,
+        "get_reply_prompts",
+        lambda: {
+            "quick": "Say hi to [NAME] and reference [SUBJECT].",
+            "follow_up": "Follow up with [NAME] about [SUBJECT] and suggest next step.",
+            "recap": "Recap the key points for [NAME] regarding [SUBJECT].",
+        },
+    )
+
+    class _FakeChatCompletions:
+        def create(self, **kwargs):
+            # generate_email_replies does NOT use response_format=json_object.
+            assert "messages" in kwargs
+            # Return some content that will be word-limited and trimmed.
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="Hello John, thanks for reaching out."))]
+            )
+
+    ai_service.client.chat.completions = _FakeChatCompletions()
+
+    replies = ai_service.generate_email_replies(
+        lead={"full_name": "John Doe"},
+        email={"subject": "Partnership", "body": "Let's talk."},
+        placeholders=None,
+    )
+
+    assert isinstance(replies, dict)
+    assert set(replies.keys()) == {"quick", "follow_up", "recap"}
+    assert all(isinstance(replies[k], str) for k in replies)
+    assert all(replies[k].strip() for k in replies)

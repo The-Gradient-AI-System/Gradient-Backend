@@ -4,8 +4,10 @@ from pathlib import Path
 import base64
 import json
 
-from db import conn
-from service.aiService import analyze_email
+from concurrent.futures import ThreadPoolExecutor
+
+from db import conn, save_cached_replies
+from service.aiService import analyze_email, preprocess_email, generate_email_replies_six
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CREDENTIALS_DIR = BASE_DIR / "credentials"
@@ -34,6 +36,11 @@ _MESSAGE_VALUE_COLUMNS = [
     "person_summary",
     "person_insights",
     "company_insights",
+    "is_lead",
+    "priority",
+    "status_label",
+    "tone",
+    "preprocessed_at",
 ]
 
 
@@ -142,12 +149,136 @@ def _store_message(gmail_id: str, values: list[str]) -> None:
         )
 
 
+def _update_stage1(gmail_id: str, stage1_result: dict) -> None:
+    """Оновлює рядок після Етапу 1 (пре-процесинг): is_lead, priority, status_label, tone, preprocessed_at."""
+    sender_name = stage1_result.get("sender_name") or ""
+    is_lead = stage1_result.get("is_lead", False)
+    priority = stage1_result.get("priority") or "normal"
+    status_label = stage1_result.get("status_label") or ""
+    tone = stage1_result.get("tone") or ""
+
+    conn.execute(
+        """
+        UPDATE gmail_messages
+        SET full_name = COALESCE(NULLIF(?, ''), full_name),
+            is_lead = ?,
+            priority = ?,
+            status_label = ?,
+            tone = ?,
+            preprocessed_at = CURRENT_TIMESTAMP
+        WHERE gmail_id = ?
+        """,
+        [sender_name, is_lead, priority, status_label, tone, gmail_id],
+    )
+
+
+_preprocess_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="preprocess")
+
+
+def _run_stage1_then_update(gmail_id: str, subject: str, body: str, sender_email: str) -> None:
+    try:
+        result = preprocess_email(subject=subject, body=body, sender=sender_email)
+        _update_stage1(gmail_id, result)
+        _preprocess_executor.submit(_run_pregen_replies, gmail_id)
+        _preprocess_executor.submit(_run_analyze_email, gmail_id)
+    except Exception as e:
+        print(f"[gmailService] Stage 1 failed for {gmail_id[:12]}...: {e}")
+
+
+def _run_pregen_replies(gmail_id: str) -> None:
+    """У фоні генерує 6 варіантів відповіді та зберігає в кеш після Етапу 1."""
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(_MESSAGE_VALUE_COLUMNS)} FROM gmail_messages WHERE gmail_id = ?",
+            [gmail_id],
+        ).fetchone()
+        if not row:
+            return
+        lead = dict(zip(_MESSAGE_VALUE_COLUMNS, (_normalize_cell(v) for v in row)))
+        email = {
+            "sender": lead.get("email") or "",
+            "subject": lead.get("subject") or "",
+            "body": lead.get("body") or "",
+        }
+        email_key = (lead.get("email") or "").strip()
+        subject_key = (lead.get("subject") or "").strip()
+        received_at_key = (lead.get("received_at") or "").strip()
+        if not email_key or not subject_key or not received_at_key:
+            return
+        replies = generate_email_replies_six(
+            lead=lead,
+            email=email,
+            tone=lead.get("tone"),
+        )
+        save_cached_replies(email_key, subject_key, received_at_key, replies)
+    except Exception as e:
+        print(f"[gmailService] Pregen replies failed for {gmail_id[:12]}...: {e}")
+
+
+def _run_analyze_email(gmail_id: str) -> None:
+    """У фоні викликає analyze_email та оновлює рядок у gmail_messages (контакт, компанія, телефон тощо). Після цього рядок готовий до синхронізації в Sheets."""
+    try:
+        row = conn.execute(
+            "SELECT body, subject, email FROM gmail_messages WHERE gmail_id = ?",
+            [gmail_id],
+        ).fetchone()
+        if not row:
+            return
+        body, subject, sender = (_normalize_cell(v) for v in row)
+        if not (body or subject):
+            return
+        result = analyze_email(subject=subject or "", body=body or "", sender=sender or "")
+        person_links = result.get("person_links") or []
+        person_insights = result.get("person_insights") or []
+        company_insights = result.get("company_insights") or []
+        conn.execute(
+            """
+            UPDATE gmail_messages
+            SET first_name = ?, last_name = ?, full_name = ?, company = ?, phone = ?,
+                website = ?, company_name = ?, company_info = ?, person_role = ?,
+                person_links = ?, person_location = ?, person_experience = ?, person_summary = ?,
+                person_insights = ?, company_insights = ?, analyzed_at = CURRENT_TIMESTAMP
+            WHERE gmail_id = ?
+            """,
+            [
+                result.get("first_name") or "",
+                result.get("last_name") or "",
+                result.get("full_name") or "",
+                result.get("company") or "",
+                result.get("phone_number") or "",
+                result.get("website") or "",
+                result.get("company") or "",
+                result.get("company_summary") or "",
+                result.get("person_role") or "",
+                json.dumps(person_links, ensure_ascii=False) if person_links else "",
+                result.get("person_location") or "",
+                result.get("person_experience") or "",
+                result.get("person_summary") or "",
+                json.dumps(person_insights, ensure_ascii=False) if person_insights else "",
+                json.dumps(company_insights, ensure_ascii=False) if company_insights else "",
+                gmail_id,
+            ],
+        )
+    except Exception as e:
+        print(f"[gmailService] Analyze email failed for {gmail_id[:12]}...: {e}")
+        # Щоб рядок не залишався без analyzed_at і міг потрапити в майбутні вибірки за потреби
+        try:
+            conn.execute(
+                "UPDATE gmail_messages SET analyzed_at = CURRENT_TIMESTAMP WHERE gmail_id = ?",
+                [gmail_id],
+            )
+        except Exception:
+            pass
+
+
 def get_unsynced_message_rows(limit: int | None = None) -> list[tuple[str, list[str]]]:
+    """Повертає листи, які вже проаналізовані (analyzed_at) і ще не в Sheets. У CRM лист з'являється готовим: з інфою + кешем відповідей, без очікування.
+    Синхронізуємо одразу після Stage 1, щоб лист з’явився в UI; analyze_email заповнює дані у фоні."""
     columns_sql = ", ".join(_MESSAGE_VALUE_COLUMNS)
     query = (
         f"SELECT gmail_id, {columns_sql} "
         "FROM gmail_messages "
-        "WHERE synced_at IS NULL "
+        "WHERE synced_at IS NULL AND preprocessed_at IS NOT NULL AND analyzed_at IS NOT NULL "
         "ORDER BY created_at"
     )
 
@@ -183,6 +314,8 @@ def mark_messages_synced(gmail_ids: list[str]) -> None:
 def _normalize_cell(value):
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value) if not isinstance(value, str) else value
@@ -247,51 +380,34 @@ def fetch_new_gmail_data(limit: int = 20):
         body_original = _extract_body(payload)
         body = _normalize_text(body_original)
 
-        parsed = analyze_email(subject=subject, body=body, sender=sender_email)
-
-        # Prioritize name from signature/body if available
-        final_sender_name = parsed.get("full_name") if parsed.get("full_name") else sender_name
-        
-        # Get company info if company name is available
-        company_info = parsed.get("company_summary") or "No company info"
-        person_summary = parsed.get("person_summary")
-        first_name = parsed.get("first_name")
-        last_name = parsed.get("last_name")
-
-        person_links = parsed.get("person_links") or []
-        if not isinstance(person_links, list):
-            person_links = [person_links] if person_links else []
-        person_links_value = json.dumps(person_links, ensure_ascii=False)
-
-        person_insights_value = json.dumps(parsed.get("person_insights") or [], ensure_ascii=False)
-        company_insights_value = json.dumps(parsed.get("company_insights") or [], ensure_ascii=False)
-
-        row = [
-            "waiting",  # status
-            first_name,
-            last_name,
-            final_sender_name,
+        # Етап 1: зберігаємо сирий лист одразу, пре-процесинг (is_lead, priority, tone) — у фоні
+        raw_row = [
+            "waiting",
+            "",
+            "",
+            sender_name or "",
             sender_email,
             subject,
             formatted_date,
-            parsed.get("company"),
+            "",
             body,
-            parsed.get("phone_number"),
-            parsed.get("website"),
-            parsed.get("company"),
-            company_info,
-            parsed.get("person_role"),
-            person_links_value,
-            parsed.get("person_location"),
-            parsed.get("person_experience"),
-            person_summary,
-            person_insights_value,
-            company_insights_value,
+            "", "", "", "", "",
+            "[]",
+            "", "", "",
+            "[]",
+            "[]",
+            False,
+            "normal",
+            "",
+            "",
+            None,
         ]
-
-        rows.append(row)
-        _store_message(msg_id, row)
+        _store_message(msg_id, raw_row)
         mark_as_processed(msg_id)
+        rows.append(raw_row)
+
+        # Фонова задача: Етап 1 (preprocess_email) → оновлення рядка
+        _preprocess_executor.submit(_run_stage1_then_update, msg_id, subject, body, sender_email)
 
     return rows
 
