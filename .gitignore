@@ -1,5 +1,6 @@
 .venv/
 .venv311/
+.venv*/
 __pycache__
 .env
 db/

@@ -1,9 +1,12 @@
+"""Password hashing using passlib (bcrypt)."""
 from passlib.context import CryptContext
 
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+def hash_password(plain: str) -> str:
+    return _ctx.hash(plain)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return _ctx.verify(plain, hashed)

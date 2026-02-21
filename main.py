@@ -7,6 +7,7 @@ from routes.gmailRoutes import router as gmail_router
 from routes.settingsRoutes import router as settings_router
 from routes.analyticsRoutes import router as analytics_router
 from service.autosyncService import auto_sync_loop
+from db import init_db
 
 app = FastAPI()
 
@@ -28,4 +29,5 @@ app.include_router(analytics_router)
 
 @app.on_event("startup")
 async def startup():
+    init_db()
     asyncio.create_task(auto_sync_loop())

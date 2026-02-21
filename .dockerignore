@@ -1,0 +1,13 @@
+.venv
+.venv311
+__pycache__
+*.pyc
+.git
+.gitignore
+*.md
+credentials
+*.duckdb
+db/*.duckdb
+.env
+.env.*
+!.env.example
