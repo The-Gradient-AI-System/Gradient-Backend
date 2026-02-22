@@ -12,8 +12,6 @@ RUN tr -d "\0" < requirements.txt > requirements_fixed.txt && mv requirements_fi
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-# Remove db/ directory if present so Python imports db.py (module), not db/ (package)
-RUN rm -rf /app/db 2>/dev/null || true
 
 ENV PORT=8000
 EXPOSE 8000
