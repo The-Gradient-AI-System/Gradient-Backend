@@ -52,10 +52,12 @@ class OPTIONSCORSMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception as e:
             import traceback
+            import json as _json
             traceback.print_exc()
+            body = {"detail": "Internal server error", "error": str(e)}
             return Response(
                 status_code=500,
-                content=f'{{"detail":"Internal server error"}}',
+                content=_json.dumps(body, ensure_ascii=False),
                 media_type="application/json",
                 headers=cors_headers,
             )
