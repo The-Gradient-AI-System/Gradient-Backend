@@ -1,5 +1,5 @@
 # Fly.io app name – change to your preferred name, e.g. gradient-backend
-app = "gradient-backend"
+app = "gradient-backend-12"
 
 [build]
 
