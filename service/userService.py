@@ -30,14 +30,15 @@ def register_user(user):
 
     hashed_pwd = hash_password(user.password)
 
-    next_id = conn.execute(
+    next_id = int(conn.execute(
         "SELECT COALESCE(MAX(id), 0) + 1 FROM users"
-    ).fetchone()[0]
+    ).fetchone()[0])
 
     conn.execute(
         "INSERT INTO users (id, username, email, password) VALUES (?, ?, ?, ?)",
         [next_id, user.username, user.email, hashed_pwd]
     )
+    conn.commit()
 
     return {"msg": "User registered successfully"}
 
