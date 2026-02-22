@@ -28,7 +28,8 @@ def register_user(user):
             detail="Username already exists"
         )
 
-    hashed_pwd = hash_password(user.password)
+    pwd = (user.password or "").encode("utf-8")[:72].decode("utf-8", errors="ignore")
+    hashed_pwd = hash_password(pwd)
 
     next_id = int(conn.execute(
         "SELECT COALESCE(MAX(id), 0) + 1 FROM users"
