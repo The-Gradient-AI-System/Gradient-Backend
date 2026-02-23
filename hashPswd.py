@@ -1,20 +1,20 @@
-"""Password hashing using passlib (bcrypt). Bcrypt accepts max 72 bytes."""
-from passlib.context import CryptContext
+"""Password hashing with bcrypt (max 72 bytes). Uses bcrypt directly to avoid passlib length error."""
+import bcrypt
 
-_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-_MAX_BCRYPT_BYTES = 72
+_MAX_BYTES = 72
 
 
-def _truncate_to_72_bytes(s: str) -> str:
-    b = s.encode("utf-8")
-    if len(b) <= _MAX_BCRYPT_BYTES:
-        return s
-    return b[:_MAX_BCRYPT_BYTES].decode("utf-8", errors="ignore")
+def _to_72_bytes(plain: str) -> bytes:
+    b = (plain or "").encode("utf-8")
+    return b[:_MAX_BYTES] if len(b) > _MAX_BYTES else b
 
 
 def hash_password(plain: str) -> str:
-    return _ctx.hash(_truncate_to_72_bytes(plain))
+    p = _to_72_bytes(plain)
+    return bcrypt.hashpw(p, bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _ctx.verify(_truncate_to_72_bytes(plain), hashed)
+    p = _to_72_bytes(plain)
+    h = hashed.encode("utf-8") if isinstance(hashed, str) else hashed
+    return bcrypt.checkpw(p, h)
