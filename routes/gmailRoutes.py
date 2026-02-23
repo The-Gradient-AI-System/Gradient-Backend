@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from db import get_cached_replies, save_cached_replies
@@ -6,8 +7,52 @@ from service.syncService import sync_gmail_to_sheets
 from service.sheetService import build_leads_payload, update_lead_status
 from service.aiService import analyze_email, generate_email_replies_six
 from service.settingsService import get_reply_prompts
+from service import gmail_oauth
 
 router = APIRouter(prefix="/gmail", tags=["Gmail"])
+
+
+@router.get("/auth")
+def gmail_auth():
+    """Redirect to Google sign-in. After login, user returns to /gmail/oauth2callback."""
+    auth_url, err = gmail_oauth.get_authorization_url()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@router.get("/oauth2callback")
+def gmail_oauth2callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    """Google redirects here after login. Exchange code for token and save token.json."""
+    if error:
+        return HTMLResponse(
+            content=f"<h1>Authorization failed</h1><p>{error}</p><p><a href='/gmail/auth'>Try again</a></p>",
+            status_code=400,
+        )
+    if not code or not state:
+        return HTMLResponse(
+            content="<h1>Missing code</h1><p>Go to <a href='/gmail/auth'>/gmail/auth</a> to start.</p>",
+            status_code=400,
+        )
+    ok, msg = gmail_oauth.exchange_code_and_save_token(code=code, state=state)
+    if not ok:
+        return HTMLResponse(
+            content=f"<h1>Token error</h1><p>{msg}</p><p><a href='/gmail/auth'>Try again</a></p>",
+            status_code=400,
+        )
+    token_for_env = gmail_oauth.token_json_for_env()
+    body = (
+        "<h1>Gmail connected</h1><p>Token saved. Auto-sync and /gmail/leads will use it.</p>"
+        "<p>On Render: copy the token and set Environment variable <strong>GMAIL_TOKEN_JSON</strong> so it persists after restarts.</p>"
+    )
+    if token_for_env:
+        esc = token_for_env.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        body += f'<script type="application/json" id="token-json">{esc}</script>'
+        body += '<button onclick="navigator.clipboard.writeText(document.getElementById(\'token-json\').textContent); this.textContent=\'Copied\'">Copy token</button>'
+        body += '<pre style="white-space:pre-wrap;width:100%;max-width:600px;font-size:11px;overflow:auto">' + esc + "</pre>"
+    body += '<p><a href="/gmail/auth">Re-authorize</a></p>'
+    return HTMLResponse(content=body)
+
 
 @router.post("/sync")
 def manual_sync():
