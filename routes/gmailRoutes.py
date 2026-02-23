@@ -15,10 +15,28 @@ def manual_sync():
     return {"saved": count}
 
 
+def _empty_leads_payload():
+    from datetime import datetime
+    now = datetime.utcnow()
+    return {
+        "leads": [],
+        "stats": {"active": 0, "completed": 0, "percentage": 0, "qualified": 0, "waiting": 0},
+        "line": [],
+        "quarter": [],
+        "month": [{"name": "Цей тижд.", "pv": 0, "uv": 0}, {"name": "Минулий", "pv": 0, "uv": 0}, {"name": "2 тиж. тому", "pv": 0, "uv": 0}, {"name": "3+ тиж.", "pv": 0, "uv": 0}],
+        "pie": [{"value": 0}, {"value": 100}],
+        "generated_at": now.isoformat(),
+    }
+
+
 @router.get("/leads")
 def get_leads(limit: int | None = Query(default=120, ge=1, le=500)):
-    payload = build_leads_payload(limit)
-    return payload
+    try:
+        return build_leads_payload(limit)
+    except FileNotFoundError:
+        return _empty_leads_payload()
+    except Exception:
+        return _empty_leads_payload()
 
 
 class LeadInsightRequest(BaseModel):
