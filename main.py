@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+from pathlib import Path
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -12,6 +13,23 @@ from routes.settingsRoutes import router as settings_router
 from routes.analyticsRoutes import router as analytics_router
 from service.autosyncService import auto_sync_loop
 from db import init_db
+
+_BASE_DIR = Path(__file__).resolve().parent
+_CREDENTIALS_DIR = _BASE_DIR / "credentials"
+_TOKEN_FILE = _CREDENTIALS_DIR / "token.json"
+
+
+def _ensure_token_from_env():
+    """If token.json is missing but GMAIL_TOKEN_JSON is set, write it to credentials/token.json (e.g. on Render)."""
+    if _TOKEN_FILE.exists():
+        return
+    raw = os.getenv("GMAIL_TOKEN_JSON")
+    if not raw or not raw.strip():
+        return
+    _CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    _TOKEN_FILE.write_text(raw.strip(), encoding="utf-8")
+    print(f"[startup] token.json created from GMAIL_TOKEN_JSON at {_TOKEN_FILE}")
+
 
 app = FastAPI()
 
@@ -85,4 +103,5 @@ app.include_router(analytics_router)
 @app.on_event("startup")
 async def startup():
     init_db()
+    _ensure_token_from_env()
     asyncio.create_task(auto_sync_loop())
