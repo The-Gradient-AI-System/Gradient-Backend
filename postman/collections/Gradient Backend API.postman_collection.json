@@ -1,0 +1,250 @@
+{
+  "info": {
+    "name": "Gradient Backend API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "API collection for the Gradient Backend (FastAPI). Base URL: {{baseUrl}}. Most endpoints require a Bearer token — set the `authToken` collection variable after login."
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{authToken}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8000", "type": "string" },
+    { "key": "authToken", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"john_doe\",\n  \"email\": \"john@example.com\",\n  \"password\": \"secret123\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/register",
+            "description": "Register a new user account."
+          }
+        },
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "var jsonData = pm.response.json();",
+                  "",
+                  "var token = jsonData.token || jsonData.access_token || jsonData.accessToken;",
+                  "",
+                  "if (token) {",
+                  "    pm.collectionVariables.set(\"authToken\", token);",
+                  "    console.log(\"Token saved to authToken collection variable:\", token);",
+                  "} else {",
+                  "    console.log(\"No token found in response. Checked fields: token, access_token, accessToken.\");",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"john_doe\",\n  \"email\": \"john@example.com\",\n  \"password\": \"secret123\"\n}"
+            },
+            "url": "{{baseUrl}}/auth/login",
+            "description": "Login and receive a Bearer token. Save the returned token to the `authToken` collection variable."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Gmail",
+      "item": [
+        {
+          "name": "Start Gmail OAuth",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/gmail/auth",
+            "description": "Redirects the browser to Google OAuth consent screen. Open this URL in a browser."
+          }
+        },
+        {
+          "name": "OAuth2 Callback",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/gmail/oauth2callback?code=AUTH_CODE&state=STATE",
+              "host": ["{{baseUrl}}"],
+              "path": ["gmail", "oauth2callback"],
+              "query": [
+                { "key": "code", "value": "AUTH_CODE", "description": "Authorization code returned by Google" },
+                { "key": "state", "value": "STATE", "description": "State parameter from the OAuth flow" },
+                { "key": "error", "value": "", "description": "Error string if OAuth failed", "disabled": true }
+              ]
+            },
+            "description": "Handles the OAuth2 callback from Google. Normally called automatically by Google's redirect."
+          }
+        },
+        {
+          "name": "Sync Gmail",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/gmail/sync",
+            "description": "Manually trigger a Gmail sync to Google Sheets."
+          }
+        },
+        {
+          "name": "Get Leads",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/gmail/leads?limit=120",
+              "host": ["{{baseUrl}}"],
+              "path": ["gmail", "leads"],
+              "query": [
+                { "key": "limit", "value": "120", "description": "Number of leads to return (1–500, default 120)" }
+              ]
+            },
+            "description": "Retrieve the list of leads from Gmail."
+          }
+        },
+        {
+          "name": "Get Lead Insights",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sender\": \"lead@example.com\",\n  \"subject\": \"Interested in your product\",\n  \"body\": \"Hi, I saw your product and would like to learn more.\"\n}"
+            },
+            "url": "{{baseUrl}}/gmail/lead-insights",
+            "description": "Run AI analysis on an email to extract lead insights."
+          }
+        },
+        {
+          "name": "Generate Replies",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sender\": \"lead@example.com\",\n  \"subject\": \"Interested in your product\",\n  \"body\": \"Hi, I saw your product and would like to learn more.\",\n  \"lead\": null,\n  \"placeholders\": null,\n  \"prompt_overrides\": null,\n  \"tone\": null,\n  \"email_style\": null\n}"
+            },
+            "url": "{{baseUrl}}/gmail/generate-replies",
+            "description": "Generate 6 AI-powered email reply suggestions for a lead."
+          }
+        },
+        {
+          "name": "Update Lead Status",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"row_number\": 2,\n  \"status\": \"Contacted\"\n}"
+            },
+            "url": "{{baseUrl}}/gmail/lead-status",
+            "description": "Update the status of a lead by its row number."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "item": [
+        {
+          "name": "Get Reply Prompts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/settings/reply-prompts",
+            "description": "Retrieve the current AI reply prompt templates."
+          }
+        },
+        {
+          "name": "Update Reply Prompts",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quick\": \"Write a quick, friendly reply.\",\n  \"follow_up\": \"Write a follow-up email.\",\n  \"recap\": \"Write a recap of our conversation.\"\n}"
+            },
+            "url": "{{baseUrl}}/settings/reply-prompts",
+            "description": "Update one or more AI reply prompt templates (quick, follow_up, recap)."
+          }
+        },
+        {
+          "name": "Get Prompts (Legacy)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/settings/prompts",
+            "description": "Legacy alias for GET /settings/reply-prompts."
+          }
+        },
+        {
+          "name": "Update Prompt (Legacy)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"quick\",\n  \"value\": \"Write a quick, friendly reply.\"\n}"
+            },
+            "url": "{{baseUrl}}/settings/prompts",
+            "description": "Legacy: update a single prompt by key."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Analytics",
+      "item": [
+        {
+          "name": "Query Analytics",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"question\": \"How many leads do we have from the US?\"\n}"
+            },
+            "url": "{{baseUrl}}/analytics/query",
+            "description": "Run a natural language analytics query against the leads data."
+          }
+        },
+        {
+          "name": "Export Leads",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/analytics/export",
+            "description": "Export all leads as a streaming .xlsx (Excel) file download."
+          }
+        }
+      ]
+    }
+  ]
+}
